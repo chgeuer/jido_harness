@@ -21,7 +21,7 @@ defmodule Jido.Harness.Connection.Protocol do
   @callback decode_buffer(buffer :: binary()) :: {[map()], binary()}
 
   @doc "Build the initialization request to send after connection."
-  @callback initialize_request(opts :: keyword()) :: map()
+  @callback initialize_request(opts :: keyword()) :: map() | nil
 
   @doc """
   Handle a decoded JSON-RPC response (has an `id` field).

@@ -60,6 +60,9 @@ defmodule Jido.Harness.Connection do
         {:ok, pid} = GenServer.start_link(__MODULE__, Keyword.put(opts, :io_mode, true))
         :gen_tcp.controlling_process(socket, pid)
         GenServer.cast(pid, {:accept_socket, socket})
+        # Sync barrier: ensure accept_socket cast is processed before returning.
+        # Without this, callers may call_rpc before the reader is started.
+        _ = GenServer.call(pid, :socket_ready?, 10_000)
         {:ok, pid}
     end
   end
@@ -82,6 +85,11 @@ defmodule Jido.Harness.Connection do
   @doc "Unsubscribe from session events."
   def unsubscribe(conn, session_id) do
     GenServer.call(conn, {:unsubscribe, session_id, self()})
+  end
+
+  @doc "Send a raw JSON map through the connection (for tool call responses etc.)."
+  def send_raw(conn, json_map) when is_map(json_map) do
+    GenServer.cast(conn, {:send_raw, json_map})
   end
 
   @doc "Stop the connection."
@@ -134,9 +142,9 @@ defmodule Jido.Harness.Connection do
 
     new_state = %{state | port: port, port_pid: os_pid, cli_path: cli_path, cli_args: cli_args}
 
-    # Send initialize request
+    # Send initialize request (protocol may return nil to skip auto-init)
     init_request = protocol.initialize_request(opts)
-    send_wire(new_state, init_request)
+    if init_request, do: send_wire(new_state, init_request)
 
     {:noreply, new_state}
   end
@@ -163,11 +171,18 @@ defmodule Jido.Harness.Connection do
 
     new_state = %{new_state | io_reader: reader}
 
-    # Send initialize request
+    # Send initialize request (protocol may return nil to skip auto-init)
     init_request = state.protocol_module.initialize_request([])
-    send_wire(new_state, init_request)
+    if init_request, do: send_wire(new_state, init_request)
 
     {:noreply, new_state}
+  end
+
+  # Send raw JSON (for out-of-band responses like tool call results)
+  @impl true
+  def handle_cast({:send_raw, json}, state) do
+    send_wire(state, json)
+    {:noreply, state}
   end
 
   # Send JSON-RPC notification (no id, no pending)
@@ -176,6 +191,12 @@ defmodule Jido.Harness.Connection do
     json = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
     send_wire(state, json)
     {:noreply, state}
+  end
+
+  # Sync barrier: confirms socket acceptance is done
+  @impl true
+  def handle_call(:socket_ready?, _from, state) do
+    {:reply, state.io_socket != nil, state}
   end
 
   # Send JSON-RPC request (with id, store in pending)
@@ -286,16 +307,16 @@ defmodule Jido.Harness.Connection do
 
         case state.protocol_module.handle_response(msg, meta) do
           {:reply, value} ->
-            GenServer.reply(from, {:ok, value})
+            if from, do: GenServer.reply(from, {:ok, value})
             state
 
           {:broadcast, session_id, event} ->
-            GenServer.reply(from, :ok)
+            if from, do: GenServer.reply(from, :ok)
             broadcast(state, session_id, event)
             state
 
           :ignore ->
-            GenServer.reply(from, :ok)
+            if from, do: GenServer.reply(from, :ok)
             state
         end
     end
@@ -324,6 +345,13 @@ defmodule Jido.Harness.Connection do
         broadcast_all(state, event)
         state
 
+      {:broadcast_and_fire, session_id, event, %{method: method, params: params, meta: meta}} ->
+        broadcast(state, session_id, event)
+        {id, state} = next_id(state)
+        json = %{"jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params}
+        send_wire(state, json)
+        %{state | pending_requests: Map.put(state.pending_requests, id, {meta, nil})}
+
       :ignore ->
         state
     end
@@ -336,6 +364,10 @@ defmodule Jido.Harness.Connection do
         send_wire(state, response)
         state
 
+      {:broadcast, session_id, event} ->
+        broadcast(state, session_id, event)
+        state
+
       :ignore ->
         state
     end
@@ -345,10 +377,8 @@ defmodule Jido.Harness.Connection do
 
   # -- Wire I/O ----------------------------------------------------------------
 
-  defp send_wire(%{io_socket: sock}, json) when not is_nil(sock) do
-    # For socket mode, we encode manually since protocol.encode might not be loaded
-    data = Jason.encode!(json) <> "\n"
-    :gen_tcp.send(sock, data)
+  defp send_wire(%{io_socket: sock, protocol_module: protocol}, json) when not is_nil(sock) do
+    :gen_tcp.send(sock, IO.iodata_to_binary(protocol.encode(json)))
   end
 
   defp send_wire(%{port: port, protocol_module: protocol}, json) when not is_nil(port) do
